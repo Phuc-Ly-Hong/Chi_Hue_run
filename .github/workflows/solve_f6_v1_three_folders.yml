@@ -1,5 +1,5 @@
 name: Solve F6 On C101 (V1 - Cluster Random Uniform)
-
+#chay lan 2
 on:
   push:
   workflow_dispatch:
