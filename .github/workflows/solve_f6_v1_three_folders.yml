@@ -1,4 +1,4 @@
-name: Solve F6 On C101 (V1 - Cluster Random Uniform)
+name: Solve F6 On C101 (V7 - Cluster Random Uniform)
 #chay lan 2
 on:
   push:
@@ -62,7 +62,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Build instance matrix for C101 in v1 of 3 folders
+      - name: Build instance matrix for C101 in v7 of 3 folders
         id: mk
         env:
           A_VALUES: ${{ github.event.inputs.a_values || '4,8' }}
@@ -99,9 +99,9 @@ jobs:
               raise SystemExit("No L values provided (L_VALUES is empty)")
 
           roots = [
-              ("cluster", "v1", pathlib.Path("test_data/data_demand_random_50_batch_all1_equal_cluster/v1")),
-              ("random", "v1", pathlib.Path("test_data/data_demand_random_50_batch_all1_equal_random/v1")),
-              ("uniform", "v1", pathlib.Path("test_data/data_demand_random_50_batch_all1_equal_uniform/v1")),
+              ("cluster", "v7", pathlib.Path("test_data/data_demand_random_50_batch_all1_equal_cluster/v7")),
+              ("random", "v7", pathlib.Path("test_data/data_demand_random_50_batch_all1_equal_random/v7")),
+              ("uniform", "v7", pathlib.Path("test_data/data_demand_random_50_batch_all1_equal_uniform/v7")),
           ]
 
           base_tasks = []
@@ -120,7 +120,7 @@ jobs:
                   )
 
           if not base_tasks:
-              raise SystemExit("No C101*.dat instances found in v1 folders")
+              raise SystemExit("No C101*.dat instances found in v7 folders")
 
           tasks = []
           for t in base_tasks:
@@ -595,7 +595,7 @@ jobs:
       - name: Upload summary artifact
         uses: actions/upload-artifact@v4
         with:
-          name: solve-f6-c101-v1-three-folders-summary
+          name: solve-f6-c101-v7-three-folders-summary
           path: |
             summary/solve_f6_from_augmented_inits_summary.csv
             batch_init_ats_improved_with_multivisit_recompute_failures.csv
