@@ -1,0 +1,212 @@
+name: Run Hanoi Reality Light Heavy
+
+on:
+  workflow_dispatch:
+    inputs:
+      time_limit_sec:
+        description: "Per-run solver time limit in seconds. Use 0 for the solver default."
+        required: true
+        default: "0"
+      extra_args:
+        description: "Extra arguments passed to tabubu_TimeDependent_hanoi_reality."
+        required: false
+        default: "--auto-tune"
+
+jobs:
+  prepare:
+    name: Prepare light/heavy instance matrix
+    runs-on: ubuntu-latest
+    outputs:
+      instances: ${{ steps.instances.outputs.instances }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Find main instance files
+        id: instances
+        shell: bash
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import glob
+          import json
+          import os
+          import re
+
+          pattern = re.compile(r"^reality\.200\.(30new|40new)\.[1-4]\.txt$")
+          files = []
+          for group in ["light", "heavy"]:
+              for path in glob.glob(f"instance_hanoi/reality/{group}/reality.200.*new.*.txt"):
+                  base = os.path.basename(path)
+                  if pattern.match(base):
+                      files.append({
+                          "group": group,
+                          "path": path,
+                          "name": base.removesuffix(".txt"),
+                      })
+
+          files.sort(key=lambda item: (item["group"], item["name"]))
+          if not files:
+              raise SystemExit("No main 200.30new/200.40new instance files found in light/heavy.")
+
+          print("instances=" + json.dumps(files))
+          PY
+
+  solve:
+    name: ${{ matrix.instance.group }} run ${{ matrix.repeat }} - ${{ matrix.instance.name }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 64
+      matrix:
+        instance: ${{ fromJson(needs.prepare.outputs.instances) }}
+        repeat:
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build solver
+        shell: bash
+        run: |
+          set -euo pipefail
+          c++ -O2 -std=c++20 tabubu_TimeDependent_hanoi_reality.cpp -o tabubu_TimeDependent_hanoi_reality
+
+      - name: Run solver
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          instance="${{ matrix.instance.path }}"
+          instance_group="${{ matrix.instance.group }}"
+          instance_name="${{ matrix.instance.name }}"
+          repeat="${{ matrix.repeat }}"
+          result_dir="results/${instance_group}/${instance_name}/run_${repeat}"
+          mkdir -p "$result_dir"
+
+          time_limit_sec="${{ github.event.inputs.time_limit_sec || '0' }}"
+          extra_args_input="${{ github.event.inputs.extra_args || '--auto-tune' }}"
+
+          args=()
+          if [[ "$time_limit_sec" != "0" ]]; then
+            args+=("--time-limit=$time_limit_sec")
+          fi
+          if [[ -n "$extra_args_input" ]]; then
+            read -r -a extra_args <<< "$extra_args_input"
+            args+=("${extra_args[@]}")
+          fi
+
+          start_epoch="$(date +%s)"
+          ./tabubu_TimeDependent_hanoi_reality "$instance" "${args[@]}" > "$result_dir/stdout.txt" 2> "$result_dir/stderr.txt"
+          end_epoch="$(date +%s)"
+
+          cp output_solution_best.txt "$result_dir/output_solution_best.txt"
+          cp output_mode_0.txt "$result_dir/output_mode_0.txt"
+
+          python3 - <<'PY' "$result_dir/stdout.txt" "$result_dir/metrics.csv" "$instance_group" "$instance_name" "$repeat" "$instance" "$start_epoch" "$end_epoch"
+          import csv
+          import re
+          import sys
+
+          stdout_path, metrics_path, instance_group, instance_name, repeat, instance, start_epoch, end_epoch = sys.argv[1:]
+          text = open(stdout_path, encoding="utf-8", errors="replace").read()
+
+          def find(pattern, default=""):
+              match = re.search(pattern, text)
+              return match.group(1) if match else default
+
+          row = {
+              "group": instance_group,
+              "instance": instance,
+              "instance_name": instance_name,
+              "repeat": repeat,
+              "initial_cost": find(r"Initial Solution Cost:\s*([0-9.eE+-]+)"),
+              "improved_cost": find(r"Improved Solution Cost:\s*([0-9.eE+-]+)"),
+              "mean_elapsed_sec": find(r"Mean elapsed Time:\s*([0-9.eE+-]+)"),
+              "validated_makespan": find(r"Total validation: Makespan=([0-9.eE+-]+)"),
+              "deadline_violation": find(r"Deadline violation=([0-9.eE+-]+)"),
+              "energy_violation": find(r"Energy violation=([0-9.eE+-]+)"),
+              "capacity_violation": find(r"Capacity violation=([0-9.eE+-]+)"),
+              "feasibility": find(r"Final solution feasibility:\s*(\S+)"),
+              "wall_time_sec": str(int(end_epoch) - int(start_epoch)),
+          }
+
+          with open(metrics_path, "w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=row.keys())
+              writer.writeheader()
+              writer.writerow(row)
+          PY
+
+      - name: Upload run result
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ matrix.instance.group }}-${{ matrix.instance.name }}-run-${{ matrix.repeat }}
+          path: results/
+          if-no-files-found: error
+
+  summarize:
+    name: Summarize results
+    needs: solve
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all results
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: result-*
+          merge-multiple: true
+
+      - name: Build summary CSV
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p summary
+
+          python3 - <<'PY'
+          import csv
+          import glob
+
+          rows = []
+          for path in glob.glob("artifacts/**/metrics.csv", recursive=True):
+              with open(path, newline="", encoding="utf-8") as f:
+                  rows.extend(csv.DictReader(f))
+
+          if not rows:
+              raise SystemExit("No metrics.csv files were downloaded.")
+
+          rows.sort(key=lambda r: (r["group"], r["instance_name"], int(r["repeat"])))
+          fields = [
+              "group",
+              "instance_name",
+              "repeat",
+              "improved_cost",
+              "validated_makespan",
+              "mean_elapsed_sec",
+              "wall_time_sec",
+              "feasibility",
+              "deadline_violation",
+              "energy_violation",
+              "capacity_violation",
+              "instance",
+          ]
+
+          with open("summary/all_runs.csv", "w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=fields)
+              writer.writeheader()
+              for row in rows:
+                  writer.writerow({field: row.get(field, "") for field in fields})
+          PY
+
+      - name: Upload summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: summary-light-heavy-5-runs
+          path: summary/
+          if-no-files-found: error
