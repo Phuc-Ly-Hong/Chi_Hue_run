@@ -1,6 +1,9 @@
 name: Run Hanoi Reality Light Heavy
 
 on:
+  push:
+    branches:
+      - Tu_paper
   workflow_dispatch:
     inputs:
       time_limit_sec:
