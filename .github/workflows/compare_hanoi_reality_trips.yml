@@ -1,0 +1,321 @@
+name: Compare Hanoi Reality Truck Trips
+
+on:
+  workflow_dispatch:
+    inputs:
+      time_limit_sec:
+        description: "Per-run solver time limit in seconds. Use 0 for the solver default."
+        required: true
+        default: "0"
+      extra_args:
+        description: "Extra arguments passed to both solvers."
+        required: false
+        default: "--auto-tune"
+
+jobs:
+  prepare:
+    name: Prepare instance matrix
+    runs-on: ubuntu-latest
+    outputs:
+      instances: ${{ steps.instances.outputs.instances }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Find main instance files
+        id: instances
+        shell: bash
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import glob
+          import json
+          import os
+          import re
+
+          pattern = re.compile(r"^reality\.\d+\.(30new|40new)\.\d+\.txt$")
+          files = [
+              {"path": path, "name": os.path.basename(path).removesuffix(".txt")}
+              for path in glob.glob("instance_hanoi/reality/reality.*.*new.*.txt")
+              if pattern.match(os.path.basename(path))
+          ]
+          files.sort(key=lambda item: item["path"])
+          if not files:
+              raise SystemExit("No main 30new/40new instance files found.")
+          print("instances=" + json.dumps(files))
+          PY
+
+  build:
+    name: Build solvers
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build
+        run: make
+
+      - name: Upload solvers
+        uses: actions/upload-artifact@v4
+        with:
+          name: solvers
+          path: |
+            tabubu_TimeDependent_hanoi_reality
+            tabubu_TimeDependent_hanoi_reality_truck1trip
+          if-no-files-found: error
+
+  solve:
+    name: ${{ matrix.model }} run ${{ matrix.repeat }} - ${{ matrix.instance.name }}
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 256
+      matrix:
+        instance: ${{ fromJson(needs.prepare.outputs.instances) }}
+        model:
+          - multi_trip
+          - truck_1_trip
+        repeat:
+          - 1
+          - 2
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download solvers
+        uses: actions/download-artifact@v4
+        with:
+          name: solvers
+          path: .
+
+      - name: Run solver
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          chmod +x tabubu_TimeDependent_hanoi_reality tabubu_TimeDependent_hanoi_reality_truck1trip
+
+          if [[ "${{ matrix.model }}" == "multi_trip" ]]; then
+            binary="./tabubu_TimeDependent_hanoi_reality"
+          else
+            binary="./tabubu_TimeDependent_hanoi_reality_truck1trip"
+          fi
+
+          instance="${{ matrix.instance.path }}"
+          instance_name="${{ matrix.instance.name }}"
+          result_dir="results/${{ matrix.model }}/${instance_name}/run_${{ matrix.repeat }}"
+          mkdir -p "$result_dir"
+
+          args=()
+          if [[ "${{ inputs.time_limit_sec }}" != "0" ]]; then
+            args+=("--time-limit=${{ inputs.time_limit_sec }}")
+          fi
+          if [[ -n "${{ inputs.extra_args }}" ]]; then
+            read -r -a extra_args <<< "${{ inputs.extra_args }}"
+            args+=("${extra_args[@]}")
+          fi
+
+          start_epoch="$(date +%s)"
+          "$binary" "$instance" "${args[@]}" > "$result_dir/stdout.txt" 2> "$result_dir/stderr.txt"
+          end_epoch="$(date +%s)"
+
+          cp output_solution_best.txt "$result_dir/output_solution_best.txt"
+          cp output_mode_0.txt "$result_dir/output_mode_0.txt"
+
+          python3 - <<'PY' "$result_dir/stdout.txt" "$result_dir/metrics.csv" "${{ matrix.model }}" "${{ matrix.repeat }}" "$instance" "$start_epoch" "$end_epoch"
+          import csv
+          import re
+          import sys
+
+          stdout_path, metrics_path, model, repeat, instance, start_epoch, end_epoch = sys.argv[1:]
+          text = open(stdout_path, encoding="utf-8", errors="replace").read()
+
+          def find(pattern, default=""):
+              match = re.search(pattern, text)
+              return match.group(1) if match else default
+
+          row = {
+              "instance": instance,
+              "model": model,
+              "repeat": repeat,
+              "initial_cost": find(r"Initial Solution Cost:\s*([0-9.eE+-]+)"),
+              "improved_cost": find(r"Improved Solution Cost:\s*([0-9.eE+-]+)"),
+              "mean_elapsed_sec": find(r"Mean elapsed Time:\s*([0-9.eE+-]+)"),
+              "validated_makespan": find(r"Total validation: Makespan=([0-9.eE+-]+)"),
+              "deadline_violation": find(r"Deadline violation=([0-9.eE+-]+)"),
+              "energy_violation": find(r"Energy violation=([0-9.eE+-]+)"),
+              "capacity_violation": find(r"Capacity violation=([0-9.eE+-]+)"),
+              "feasibility": find(r"Final solution feasibility:\s*(\S+)"),
+              "wall_time_sec": str(int(end_epoch) - int(start_epoch)),
+          }
+
+          with open(metrics_path, "w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=row.keys())
+              writer.writeheader()
+              writer.writerow(row)
+          PY
+
+      - name: Upload run result
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ matrix.model }}-${{ matrix.repeat }}-${{ matrix.instance.name }}
+          path: results/
+          if-no-files-found: error
+
+  compare:
+    name: Compare results
+    needs: solve
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all results
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: result-*
+          merge-multiple: true
+
+      - name: Build comparison tables
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p comparison
+
+          python3 - <<'PY'
+          import csv
+          import glob
+          import os
+          from collections import defaultdict
+
+          rows = []
+          for path in glob.glob("artifacts/**/metrics.csv", recursive=True):
+              with open(path, newline="", encoding="utf-8") as f:
+                  rows.extend(csv.DictReader(f))
+
+          if not rows:
+              raise SystemExit("No metrics.csv files were downloaded.")
+
+          def to_float(value):
+              try:
+                  return float(value)
+              except (TypeError, ValueError):
+                  return None
+
+          rows.sort(key=lambda r: (r["instance"], r["repeat"], r["model"]))
+
+          fields = [
+              "instance",
+              "repeat",
+              "model",
+              "improved_cost",
+              "validated_makespan",
+              "mean_elapsed_sec",
+              "wall_time_sec",
+              "feasibility",
+              "deadline_violation",
+              "energy_violation",
+              "capacity_violation",
+          ]
+          with open("comparison/all_runs.csv", "w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=fields)
+              writer.writeheader()
+              for row in rows:
+                  writer.writerow({field: row.get(field, "") for field in fields})
+
+          groups = defaultdict(list)
+          for row in rows:
+              groups[(row["instance"], row["model"])].append(row)
+
+          summary_fields = [
+              "instance",
+              "model",
+              "runs",
+              "best_improved_cost",
+              "avg_improved_cost",
+              "avg_validated_makespan",
+              "avg_mean_elapsed_sec",
+              "feasible_runs",
+          ]
+          summaries = []
+          for (instance, model), group in sorted(groups.items()):
+              costs = [to_float(r["improved_cost"]) for r in group if to_float(r["improved_cost"]) is not None]
+              makespans = [to_float(r["validated_makespan"]) for r in group if to_float(r["validated_makespan"]) is not None]
+              elapsed = [to_float(r["mean_elapsed_sec"]) for r in group if to_float(r["mean_elapsed_sec"]) is not None]
+              summaries.append({
+                  "instance": instance,
+                  "model": model,
+                  "runs": len(group),
+                  "best_improved_cost": min(costs) if costs else "",
+                  "avg_improved_cost": sum(costs) / len(costs) if costs else "",
+                  "avg_validated_makespan": sum(makespans) / len(makespans) if makespans else "",
+                  "avg_mean_elapsed_sec": sum(elapsed) / len(elapsed) if elapsed else "",
+                  "feasible_runs": sum(1 for r in group if r.get("feasibility") == "FEASIBLE"),
+              })
+
+          with open("comparison/summary_by_instance_model.csv", "w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=summary_fields)
+              writer.writeheader()
+              writer.writerows(summaries)
+
+          paired_fields = [
+              "instance",
+              "multi_trip_avg_cost",
+              "truck_1_trip_avg_cost",
+              "truck_1_trip_minus_multi_trip",
+              "better_model",
+          ]
+          summary_by_key = {(s["instance"], s["model"]): s for s in summaries}
+          instances = sorted({s["instance"] for s in summaries})
+          paired = []
+          for instance in instances:
+              multi = summary_by_key.get((instance, "multi_trip"), {})
+              one = summary_by_key.get((instance, "truck_1_trip"), {})
+              multi_cost = to_float(multi.get("avg_improved_cost"))
+              one_cost = to_float(one.get("avg_improved_cost"))
+              diff = one_cost - multi_cost if one_cost is not None and multi_cost is not None else ""
+              if diff == "":
+                  better = ""
+              elif diff < 0:
+                  better = "truck_1_trip"
+              elif diff > 0:
+                  better = "multi_trip"
+              else:
+                  better = "tie"
+              paired.append({
+                  "instance": instance,
+                  "multi_trip_avg_cost": multi.get("avg_improved_cost", ""),
+                  "truck_1_trip_avg_cost": one.get("avg_improved_cost", ""),
+                  "truck_1_trip_minus_multi_trip": diff,
+                  "better_model": better,
+              })
+
+          with open("comparison/paired_comparison.csv", "w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=paired_fields)
+              writer.writeheader()
+              writer.writerows(paired)
+
+          with open("comparison/summary.md", "w", encoding="utf-8") as f:
+              f.write("# Hanoi Reality Trip Model Comparison\n\n")
+              f.write("| Instance | Multi trip avg | Truck 1 trip avg | Difference | Better |\n")
+              f.write("| --- | ---: | ---: | ---: | --- |\n")
+              for row in paired:
+                  f.write(
+                      f"| {os.path.basename(row['instance'])} | "
+                      f"{row['multi_trip_avg_cost']} | "
+                      f"{row['truck_1_trip_avg_cost']} | "
+                      f"{row['truck_1_trip_minus_multi_trip']} | "
+                      f"{row['better_model']} |\n"
+                  )
+          PY
+
+          cat comparison/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload comparison
+        uses: actions/upload-artifact@v4
+        with:
+          name: comparison
+          path: comparison/
+          if-no-files-found: error
