@@ -47,30 +47,9 @@ jobs:
           print("instances=" + json.dumps(files))
           PY
 
-  build:
-    name: Build solvers
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Build
-        run: make
-
-      - name: Upload solvers
-        uses: actions/upload-artifact@v4
-        with:
-          name: solvers
-          path: |
-            tabubu_TimeDependent_hanoi_reality
-            tabubu_TimeDependent_hanoi_reality_truck1trip
-          if-no-files-found: error
-
   solve:
-    name: ${{ matrix.model }} run ${{ matrix.repeat }} - ${{ matrix.instance.name }}
-    needs:
-      - prepare
-      - build
+    name: ${{ matrix.model }} cap ${{ matrix.drone_capacity_kg }}kg run ${{ matrix.repeat }} - ${{ matrix.instance.name }}
+    needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
@@ -81,6 +60,9 @@ jobs:
         model:
           - multi_trip
           - truck_1_trip
+        drone_capacity_kg:
+          - 5
+          - 10
         repeat:
           - 1
           - 2
@@ -88,18 +70,38 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download solvers
-        uses: actions/download-artifact@v4
-        with:
-          name: solvers
-          path: .
+      - name: Set drone capacity and build solvers
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import pathlib
+          import re
+
+          capacity = "${{ matrix.drone_capacity_kg }}"
+          for path in [
+              pathlib.Path("tabubu_TimeDependent_hanoi_reality.cpp"),
+              pathlib.Path("tabubu_TimeDependent_hanoi_reality_truck1trip.cpp"),
+          ]:
+              text = path.read_text()
+              text, count = re.subn(
+                  r"double Dd = [0-9.]+, E = 7200000\.0;",
+                  f"double Dd = {capacity}.0, E = 7200000.0;",
+                  text,
+                  count=1,
+              )
+              if count != 1:
+                  raise SystemExit(f"Could not update drone capacity in {path}")
+              path.write_text(text)
+          PY
+
+          make
 
       - name: Run solver
         shell: bash
         run: |
           set -euo pipefail
-
-          chmod +x tabubu_TimeDependent_hanoi_reality tabubu_TimeDependent_hanoi_reality_truck1trip
 
           if [[ "${{ matrix.model }}" == "multi_trip" ]]; then
             binary="./tabubu_TimeDependent_hanoi_reality"
@@ -109,7 +111,8 @@ jobs:
 
           instance="${{ matrix.instance.path }}"
           instance_name="${{ matrix.instance.name }}"
-          result_dir="results/${{ matrix.model }}/${instance_name}/run_${{ matrix.repeat }}"
+          capacity_label="drone_cap_${{ matrix.drone_capacity_kg }}kg"
+          result_dir="results/${capacity_label}/${{ matrix.model }}/${instance_name}/run_${{ matrix.repeat }}"
           mkdir -p "$result_dir"
 
           time_limit_sec="${{ github.event.inputs.time_limit_sec || '0' }}"
@@ -131,12 +134,12 @@ jobs:
           cp output_solution_best.txt "$result_dir/output_solution_best.txt"
           cp output_mode_0.txt "$result_dir/output_mode_0.txt"
 
-          python3 - <<'PY' "$result_dir/stdout.txt" "$result_dir/metrics.csv" "${{ matrix.model }}" "${{ matrix.repeat }}" "$instance" "$start_epoch" "$end_epoch"
+          python3 - <<'PY' "$result_dir/stdout.txt" "$result_dir/metrics.csv" "${{ matrix.model }}" "${{ matrix.drone_capacity_kg }}" "${{ matrix.repeat }}" "$instance" "$start_epoch" "$end_epoch"
           import csv
           import re
           import sys
 
-          stdout_path, metrics_path, model, repeat, instance, start_epoch, end_epoch = sys.argv[1:]
+          stdout_path, metrics_path, model, drone_capacity_kg, repeat, instance, start_epoch, end_epoch = sys.argv[1:]
           text = open(stdout_path, encoding="utf-8", errors="replace").read()
 
           def find(pattern, default=""):
@@ -146,6 +149,7 @@ jobs:
           row = {
               "instance": instance,
               "model": model,
+              "drone_capacity_kg": drone_capacity_kg,
               "repeat": repeat,
               "initial_cost": find(r"Initial Solution Cost:\s*([0-9.eE+-]+)"),
               "improved_cost": find(r"Improved Solution Cost:\s*([0-9.eE+-]+)"),
@@ -167,7 +171,7 @@ jobs:
       - name: Upload run result
         uses: actions/upload-artifact@v4
         with:
-          name: result-${{ matrix.model }}-${{ matrix.repeat }}-${{ matrix.instance.name }}
+          name: result-cap${{ matrix.drone_capacity_kg }}kg-${{ matrix.model }}-${{ matrix.repeat }}-${{ matrix.instance.name }}
           path: results/
           if-no-files-found: error
 
@@ -210,10 +214,11 @@ jobs:
               except (TypeError, ValueError):
                   return None
 
-          rows.sort(key=lambda r: (r["instance"], r["repeat"], r["model"]))
+          rows.sort(key=lambda r: (r["instance"], r["drone_capacity_kg"], r["repeat"], r["model"]))
 
           fields = [
               "instance",
+              "drone_capacity_kg",
               "repeat",
               "model",
               "improved_cost",
@@ -233,10 +238,11 @@ jobs:
 
           groups = defaultdict(list)
           for row in rows:
-              groups[(row["instance"], row["model"])].append(row)
+              groups[(row["instance"], row["drone_capacity_kg"], row["model"])].append(row)
 
           summary_fields = [
               "instance",
+              "drone_capacity_kg",
               "model",
               "runs",
               "best_improved_cost",
@@ -246,12 +252,13 @@ jobs:
               "feasible_runs",
           ]
           summaries = []
-          for (instance, model), group in sorted(groups.items()):
+          for (instance, drone_capacity_kg, model), group in sorted(groups.items()):
               costs = [to_float(r["improved_cost"]) for r in group if to_float(r["improved_cost"]) is not None]
               makespans = [to_float(r["validated_makespan"]) for r in group if to_float(r["validated_makespan"]) is not None]
               elapsed = [to_float(r["mean_elapsed_sec"]) for r in group if to_float(r["mean_elapsed_sec"]) is not None]
               summaries.append({
                   "instance": instance,
+                  "drone_capacity_kg": drone_capacity_kg,
                   "model": model,
                   "runs": len(group),
                   "best_improved_cost": min(costs) if costs else "",
@@ -268,17 +275,18 @@ jobs:
 
           paired_fields = [
               "instance",
+              "drone_capacity_kg",
               "multi_trip_avg_cost",
               "truck_1_trip_avg_cost",
               "truck_1_trip_minus_multi_trip",
               "better_model",
           ]
-          summary_by_key = {(s["instance"], s["model"]): s for s in summaries}
-          instances = sorted({s["instance"] for s in summaries})
+          summary_by_key = {(s["instance"], s["drone_capacity_kg"], s["model"]): s for s in summaries}
+          instance_capacities = sorted({(s["instance"], s["drone_capacity_kg"]) for s in summaries})
           paired = []
-          for instance in instances:
-              multi = summary_by_key.get((instance, "multi_trip"), {})
-              one = summary_by_key.get((instance, "truck_1_trip"), {})
+          for instance, drone_capacity_kg in instance_capacities:
+              multi = summary_by_key.get((instance, drone_capacity_kg, "multi_trip"), {})
+              one = summary_by_key.get((instance, drone_capacity_kg, "truck_1_trip"), {})
               multi_cost = to_float(multi.get("avg_improved_cost"))
               one_cost = to_float(one.get("avg_improved_cost"))
               diff = one_cost - multi_cost if one_cost is not None and multi_cost is not None else ""
@@ -292,6 +300,7 @@ jobs:
                   better = "tie"
               paired.append({
                   "instance": instance,
+                  "drone_capacity_kg": drone_capacity_kg,
                   "multi_trip_avg_cost": multi.get("avg_improved_cost", ""),
                   "truck_1_trip_avg_cost": one.get("avg_improved_cost", ""),
                   "truck_1_trip_minus_multi_trip": diff,
@@ -305,11 +314,12 @@ jobs:
 
           with open("comparison/summary.md", "w", encoding="utf-8") as f:
               f.write("# Hanoi Reality Trip Model Comparison\n\n")
-              f.write("| Instance | Multi trip avg | Truck 1 trip avg | Difference | Better |\n")
-              f.write("| --- | ---: | ---: | ---: | --- |\n")
+              f.write("| Instance | Drone cap kg | Multi trip avg | Truck 1 trip avg | Difference | Better |\n")
+              f.write("| --- | ---: | ---: | ---: | ---: | --- |\n")
               for row in paired:
                   f.write(
                       f"| {os.path.basename(row['instance'])} | "
+                      f"{row['drone_capacity_kg']} | "
                       f"{row['multi_trip_avg_cost']} | "
                       f"{row['truck_1_trip_avg_cost']} | "
                       f"{row['truck_1_trip_minus_multi_trip']} | "
