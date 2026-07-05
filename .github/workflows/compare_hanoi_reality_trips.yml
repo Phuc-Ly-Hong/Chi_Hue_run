@@ -1,6 +1,9 @@
 name: Compare Hanoi Reality Truck Trips
 
 on:
+  push:
+    branches:
+      - Tu_paper
   workflow_dispatch:
     inputs:
       time_limit_sec:
@@ -109,12 +112,15 @@ jobs:
           result_dir="results/${{ matrix.model }}/${instance_name}/run_${{ matrix.repeat }}"
           mkdir -p "$result_dir"
 
+          time_limit_sec="${{ github.event.inputs.time_limit_sec || '0' }}"
+          extra_args_input="${{ github.event.inputs.extra_args || '--auto-tune' }}"
+
           args=()
-          if [[ "${{ inputs.time_limit_sec }}" != "0" ]]; then
-            args+=("--time-limit=${{ inputs.time_limit_sec }}")
+          if [[ "$time_limit_sec" != "0" ]]; then
+            args+=("--time-limit=$time_limit_sec")
           fi
-          if [[ -n "${{ inputs.extra_args }}" ]]; then
-            read -r -a extra_args <<< "${{ inputs.extra_args }}"
+          if [[ -n "$extra_args_input" ]]; then
+            read -r -a extra_args <<< "$extra_args_input"
             args+=("${extra_args[@]}")
           fi
 
