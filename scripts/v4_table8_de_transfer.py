@@ -8,12 +8,15 @@ import urllib.parse
 
 import v4_table8_actions as table8
 
+PARALLEL_JOBS_PER_BATCH = 4
+
 
 def prepare(args):
     source_sha = os.environ["GITHUB_SHA"]
-    table8.build(argparse.Namespace(dataset="de", parallel_jobs=20, bundle=args.bundle, source_sha=source_sha))
+    table8.build(argparse.Namespace(dataset="de", parallel_jobs=10 * PARALLEL_JOBS_PER_BATCH,
+                                   bundle=args.bundle, source_sha=source_sha))
     table8.prepare(argparse.Namespace(bundle=args.bundle, phase="DE", calibration=None, batch=args.batch,
-                                     source_sha=source_sha, parallel=2, output=args.runtime))
+                                     source_sha=source_sha, parallel=PARALLEL_JOBS_PER_BATCH, output=args.runtime))
     for name in ("manifest.json", "baseline.json"):
         shutil.copyfile(args.bundle / name, args.runtime / name)
     scripts = Path(__file__).resolve().parent
