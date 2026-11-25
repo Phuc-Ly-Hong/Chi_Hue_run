@@ -3,14 +3,16 @@
 #include <cmath>
 #include <string>
 
-static char table8_scenario = 'A';
+static std::string table8_scenario = "A";
 static bool table8_calibration_iterations = false;
-static bool table8_tie_break() { return table8_scenario == 'E'; }
-static bool table8_switches_mode() { return table8_scenario == 'B' || table8_scenario == 'D'; }
+static bool table8_tie_break() { return table8_scenario == "E"; }
+static bool table8_switches_mode() {
+    return table8_scenario == "B" || table8_scenario == "D" || table8_scenario == "D_paper";
+}
 
 // N7/N8 already use fleet scope inside the V4 neighbourhood implementation.
-static bool table8_fleet_scope() {
-    return table8_scenario == 'C';
+static bool table8_fleet_scope(bool workload) {
+    return table8_scenario == "C" || (table8_scenario == "D_paper" && workload);
 }
 
 static bool table8_improves(double primary, double secondary, double reference,
@@ -29,7 +31,7 @@ int main(int argc, char* argv[]) {
     try {
         if (argc < 3) {
             std::cerr << "Usage: " << argv[0]
-                      << " INSTANCE --scenario=A|B|C|D|E --result-json=PATH"
+                      << " INSTANCE --scenario=A|B|C|D|E|D_paper --result-json=PATH"
                          " [--process-time-limit=SECONDS] [V4 options]\n";
             return 1;
         }
@@ -40,10 +42,11 @@ int main(int argc, char* argv[]) {
         for (int i = 2; i < argc; ++i) {
             std::string arg = argv[i], value;
             if (parse_kv_flag(arg, "--scenario", value)) {
-                if (scenario_given || value.size() != 1 || value[0] < 'A' || value[0] > 'E')
-                    throw std::runtime_error("Pass one --scenario from A to E");
+                const bool letter = value.size() == 1 && value[0] >= 'A' && value[0] <= 'E';
+                if (scenario_given || (!letter && value != "D_paper"))
+                    throw std::runtime_error("Pass one --scenario: A, B, C, D, E, or D_paper");
                 scenario_given = true;
-                table8_scenario = value[0];
+                table8_scenario = value;
                 continue;
             }
             if (parse_kv_flag(arg, "--process-time-limit", value)) {
@@ -62,9 +65,9 @@ int main(int argc, char* argv[]) {
                 throw std::runtime_error("Table 8 uses a single solver run with an optional process deadline");
             args.push_back(argv[i]);
         }
-        if (!scenario_given || !result_given || (!deadline_given && table8_scenario != 'A'))
-            throw std::runtime_error("Required: --scenario, --result-json and a process time limit for B through E");
-        table8_calibration_iterations = table8_scenario == 'A' && table8_calibration_iterations;
+        if (!scenario_given || !result_given || (!deadline_given && table8_scenario != "A"))
+            throw std::runtime_error("Required: --scenario, --result-json and a process time limit for timed scenarios");
+        table8_calibration_iterations = table8_scenario == "A" && table8_calibration_iterations;
         const int count = static_cast<int>(args.size());
         args.push_back(nullptr);
         return v4_table8_solver_main(count, args.data());

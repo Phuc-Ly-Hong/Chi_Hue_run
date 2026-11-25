@@ -21,7 +21,7 @@ from run_v4_table8 import read_json, run_row, sha256, summarize, summarize_table
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = "v4-table8-batch.yml"
-SCENARIOS = {"A": "A", "BCD": "BCD", "DE": "DE"}
+SCENARIOS = {"A": ("A",), "BCD": ("B", "C", "D"), "DE": ("D", "E"), "D_paper": ("D_paper",)}
 MAX_SOLVER_JOBS = 248  # The prepare and pack jobs also count towards 250.
 POLL_SECONDS = 60
 SOLVER = "solver.exe" if os.name == "nt" else "solver"
@@ -82,12 +82,12 @@ def batching(manifest, phase, budgets):
     seeds = manifest["seeds"]
     per_instance = len(seeds) * len(scenarios)
     n200 = manifest.get("dataset") == "n200"
-    de = phase == "DE"
-    max_instances = (MAX_SOLVER_JOBS - int(n200 or de)) // per_instance
+    uses_frozen_a = phase in ("DE", "D_paper")
+    max_instances = (MAX_SOLVER_JOBS - int(n200 or uses_frozen_a)) // per_instance
     # Keep the larger input ZIP small enough to transfer to every solver job.
     if n200:
         count = 4
-    elif de:
+    elif uses_frozen_a:
         count = 10
     else:
         count = math.ceil(len(instances) / max_instances)
@@ -111,7 +111,7 @@ def batching(manifest, phase, budgets):
             {"instance": inst["instance"], "n": inst["customers"], "seed": seed,
              "scenario": scenario, "iterations": iteration_budget(inst["customers"]),
              "Ti_seconds": budgets[inst["instance"]] if budgets is not None else None,
-             **({"corrected_d": True} if de and scenario == "D" else {}),
+             **({"corrected_d": True} if phase == "DE" and scenario == "D" else {}),
              **({"calibration_limit_seconds": manifest["max_solve_seconds"]}
                 if phase == "A" and manifest.get("max_solve_seconds") is not None else {})}
             for inst in bucket for seed in seeds for scenario in scenarios
@@ -121,9 +121,9 @@ def batching(manifest, phase, budgets):
 
 def load_batches(bundle, phase, calibration):
     manifest = read_json(bundle / "manifest.json")
-    if phase == "DE":
+    if phase in ("DE", "D_paper"):
         if manifest["dataset"] != "de":
-            raise ValueError("Phase DE requires a frozen DE bundle")
+            raise ValueError(f"Phase {phase} requires a bundle with the previous A baselines")
         budgets = {name: row["Ti_seconds"] for name, row in
                    read_json(bundle / "baseline.json")["instances"].items()}
     else:
@@ -168,12 +168,16 @@ def validate_result(result, task):
         raise ValueError(f"Result identity differs from task {task}")
     flags = result["enabled_components"]
     if (flags["simulated_annealing"] or flags["destroy_repair"] or not flags["adaptive_selection"]
-            or flags["mode_switching"] != (task["scenario"] in "BD")
+            or flags["mode_switching"] != (task["scenario"] in ("B", "D", "D_paper"))
             or flags["workload_tie_break"] != (task["scenario"] == "E")):
         raise ValueError(f"Unexpected ablation flags for {task}")
-    if task.get("corrected_d") and (result["makespan_fleet_neighborhoods"] != [7, 8]
-                                    or result["workload_fleet_neighborhoods"] != [7, 8]):
-        raise ValueError(f"Corrected D must use fleet scope only on N7/N8 in both modes: {task}")
+    if task["scenario"] == "D_paper":
+        if (result["makespan_fleet_neighborhoods"] != [7, 8]
+                or result["workload_fleet_neighborhoods"] != list(range(9))):
+            raise ValueError(f"D_paper requires fleet scope on N7/N8 in makespan and N0–N8 in workload: {task}")
+    elif task.get("corrected_d") and (result["makespan_fleet_neighborhoods"] != [7, 8]
+                                      or result["workload_fleet_neighborhoods"] != [7, 8]):
+        raise ValueError(f"D must use fleet scope only on N7/N8 in both modes: {task}")
     if result["completed_iterations"] != result["makespan_iterations"] + result["workload_iterations"]:
         raise ValueError(f"Invalid iteration counters for {task}")
     if not math.isfinite(result["elapsed_seconds"]) or result["elapsed_seconds"] <= 0:
@@ -538,10 +542,12 @@ def advance_de(args):
     if not campaign.read_phase("DE", batches, args.output):
         print("Waiting for the remaining D/E batches to publish their results.", flush=True)
         return
-    report_de(args.bundle / "baseline.json", args.output)
+    report_timed_against_a(args.bundle / "baseline.json", args.output, SCENARIOS["DE"])
+    with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as stream:
+        print("reported=true", file=stream)
 
 
-def report_de(baseline_path, output):
+def report_timed_against_a(baseline_path, output, scenarios):
     baseline = read_json(baseline_path)
     write_json(output / "baseline.json", baseline)
     groups = defaultdict(list)
@@ -559,7 +565,7 @@ def report_de(baseline_path, output):
         group = sorted(groups[name], key=lambda row: (row["scenario"], row["seed"]))
         runs.extend(group)
         reference = baseline["instances"][name]
-        for row in summarize(group, "DE"):
+        for row in summarize(group, scenarios):
             if row["best_makespan"] is not None:
                 row["best_gap_vs_a_pct"] = 100 * (row["best_makespan"] / reference["best_makespan"] - 1)
             if row["feasible_runs"] == row["runs"]:
@@ -572,10 +578,8 @@ def report_de(baseline_path, output):
               "N200": [row for row in summaries if row["customers"] == 200]}
     write_csv(output / "table8_summary.csv", [
         {"scope": scope, **row}
-        for scope, rows in scopes.items() for row in summarize_table(rows, "DE")
+        for scope, rows in scopes.items() for row in summarize_table(rows, scenarios)
     ])
-    with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as stream:
-        print("reported=true", file=stream)
 
 
 def report(args):
