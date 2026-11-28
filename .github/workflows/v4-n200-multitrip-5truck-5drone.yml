@@ -1,0 +1,18 @@
+name: V4 n200 multi-trip 5 trucks 5 drones DD5 and DD10
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v4-n200-5t5d-run-*'
+
+permissions:
+  contents: read
+
+jobs:
+  experiment:
+    uses: ./.github/workflows/v4-n200-multitrip-4truck-6drone.yml
+    with:
+      truck_count: 5
+      drone_count: 5
+      drone_capacities: '[5, 10]'

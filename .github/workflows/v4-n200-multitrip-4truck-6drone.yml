@@ -1,0 +1,249 @@
+name: V4 n200 multi-trip 4 trucks 6 drones
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v4-n200-4t6d-run-*'
+  workflow_call:
+    inputs:
+      truck_count:
+        type: number
+        default: 4
+      drone_count:
+        type: number
+        default: 6
+      drone_capacities:
+        type: string
+        default: '[2.27]'
+
+permissions:
+  contents: read
+
+env:
+  V4_BUNDLE: experiments/tables678_irace_v4/full_20261123/bundle
+  ARTIFACT_PREFIX: v4-n200-multitrip-${{ inputs.truck_count || 4 }}t${{ inputs.drone_count || 6 }}d
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /experiments/tables678_irace_v4/full_20261123/bundle/
+
+      - name: Set up MinGW UCRT64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: mingw-w64-ucrt-x86_64-gcc
+
+      - name: Build the frozen V4 solver
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          mkdir runtime
+          g++ -std=c++17 -O2 -static -static-libgcc -static-libstdc++ \
+            "$V4_BUNDLE/source/solver.cpp" -o runtime/solver.exe
+          g++ --version > runtime/compiler.txt
+          cp "$V4_BUNDLE/inputs.zip" "$V4_BUNDLE/manifest.json" runtime/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_PREFIX }}-runtime
+          path: runtime/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+          overwrite: true
+
+  solve:
+    name: Solve ${{ matrix.instance }} seed ${{ matrix.seed }} (${{ matrix.drone_capacity }} kg)
+    needs: build
+    runs-on: windows-2022
+    timeout-minutes: 130
+    strategy:
+      fail-fast: false
+      matrix:
+        instance:
+          - '200.10.1'
+          - '200.10.2'
+          - '200.10.3'
+          - '200.10.4'
+          - '200.20.1'
+          - '200.20.2'
+          - '200.20.3'
+          - '200.20.4'
+          - '200.30.1'
+          - '200.30.2'
+          - '200.30.3'
+          - '200.30.4'
+          - '200.40.1'
+          - '200.40.2'
+          - '200.40.3'
+          - '200.40.4'
+        seed: [42, 43, 44, 45, 46]
+        drone_capacity: ${{ fromJSON(inputs.drone_capacities || '[2.27]') }}
+
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_PREFIX }}-runtime
+          path: runtime
+
+      - name: Solve one instance and save its feasible incumbent
+        shell: pwsh
+        env:
+          INSTANCE: ${{ matrix.instance }}
+          RUN_SEED: ${{ matrix.seed }}
+          TRUCK_COUNT: ${{ inputs.truck_count || 4 }}
+          DRONE_COUNT: ${{ inputs.drone_count || 6 }}
+          DRONE_CAPACITY: ${{ matrix.drone_capacity }}
+          PAPER_VARIANT: switch_dr_sa
+          OMP_NUM_THREADS: '1'
+          OPENBLAS_NUM_THREADS: '1'
+          MKL_NUM_THREADS: '1'
+        run: |
+          @'
+          import hashlib
+          import json
+          import math
+          import os
+          from pathlib import Path
+          import subprocess
+          import time
+          from zipfile import ZipFile
+
+          instance = os.environ['INSTANCE']
+          seed = int(os.environ['RUN_SEED'])
+          variant = os.environ['PAPER_VARIANT']
+          trucks = int(os.environ['TRUCK_COUNT'])
+          drones = int(os.environ['DRONE_COUNT'])
+          drone_capacity = float(os.environ['DRONE_CAPACITY'])
+          runtime = Path('runtime').resolve()
+          output = Path('result').resolve()
+          output.mkdir()
+          manifest = json.loads((runtime / 'manifest.json').read_text(encoding='utf-8'))
+          entry = next(row for row in manifest['instances'] if row['instance'] == instance)
+          baseline_task = next(row for row in manifest['tasks']
+                               if (row['instance'], row['variant'], row['seed']) == (instance, variant, seed))
+          if (entry['customers'], entry['trucks'], entry['drones']) != (200, 5, 5):
+              raise ValueError(f'Unexpected input fleet for {instance}: {entry}')
+          if manifest['algorithm_policy'] != 'irace-v4' or variant != 'switch_dr_sa':
+              raise ValueError('Unexpected solver configuration')
+
+          parameters = manifest['parameters'].copy()
+          parameters.update(truck_capacity=70, drone_capacity=drone_capacity)
+          iterations = baseline_task['iterations']
+          segment_iters = math.ceil(parameters['cseg'] * entry['customers'])
+          hard_cap = 7200
+          # Match the original campaign: leave two seconds to write the final JSON.
+          soft_cap = hard_cap - 2
+          if (iterations, segment_iters, manifest['process_caps']['200']) != (27000, 200, hard_cap):
+              raise ValueError('Unexpected V4 iteration or time budget')
+
+          work = Path('work').resolve()
+          work.mkdir()
+          input_path = work / f'{instance}.txt'
+          with ZipFile(runtime / 'inputs.zip') as archive:
+              for member in entry['files']:
+                  data = archive.read(member['path'])
+                  if hashlib.sha256(data).hexdigest() != member['sha256']:
+                      raise ValueError(f"Input checksum mismatch: {member['path']}")
+                  destination = work / Path(member['path']).name
+                  if destination == input_path:
+                      lines = data.splitlines(keepends=True)
+                      if [line.strip() for line in lines[:2]] != [b'trucks_count 5', b'drones_count 5']:
+                          raise ValueError(f'Unexpected fleet header: {destination.name}')
+                      lines[0] = lines[0].replace(b'5', str(trucks).encode('ascii'), 1)
+                      lines[1] = lines[1].replace(b'5', str(drones).encode('ascii'), 1)
+                      data = b''.join(lines)
+                  destination.write_bytes(data)
+
+          executable = runtime / 'solver.exe'
+          incumbent = output / 'incumbent.json'
+          command = [
+              str(executable), str(input_path), '--attempts=1', f'--seed={seed}',
+              f'--iters={iterations}', f'--segment-iters={segment_iters}',
+              f'--process-time-limit={soft_cap}', f'--result-json={incumbent}',
+              f'--truck-vmax-file={work / (instance + ".vmax_ij.txt")}',
+              f'--truck-theta-file={work / (instance + ".theta_ijl.txt")}',
+              *(f'--{key.replace("_", "-")}={value}' for key, value in parameters.items()),
+          ]
+          task = {
+              'instance': instance, 'customers': 200, 'mode': 'multi_trip',
+              'trucks': trucks, 'drones': drones, 'seed': seed, 'variant': variant,
+              'parameters': parameters, 'iterations': iterations, 'segment_iters': segment_iters,
+              'process_hard_limit_seconds': hard_cap, 'process_soft_limit_seconds': soft_cap,
+              'baseline_protocol_id': manifest['protocol_id'],
+              'solver_sha256': hashlib.sha256(executable.read_bytes()).hexdigest(),
+              'instance_sha256': hashlib.sha256(input_path.read_bytes()).hexdigest(),
+              'compiler': (runtime / 'compiler.txt').read_text(encoding='utf-8').splitlines()[0],
+              'github_sha': os.environ['GITHUB_SHA'], 'github_run_id': os.environ['GITHUB_RUN_ID'],
+              'github_run_attempt': os.environ['GITHUB_RUN_ATTEMPT'], 'command': command,
+          }
+
+          def save(name, record):
+              (output / name).write_text(json.dumps(record, indent=2, allow_nan=False) + '\n', encoding='utf-8')
+
+          save('request.json', task)
+          start = time.monotonic()
+          hard_timed_out = False
+          returncode = None
+          with (output / 'stdout.log').open('wb') as stdout, (output / 'stderr.log').open('wb') as stderr:
+              try:
+                  returncode = subprocess.run(command, cwd=work, stdout=stdout, stderr=stderr,
+                                              timeout=hard_cap).returncode
+              except subprocess.TimeoutExpired:
+                  hard_timed_out = True
+          elapsed = time.monotonic() - start
+          result = json.loads(incumbent.read_text(encoding='utf-8')) if incumbent.is_file() else None
+          stop_reason = result['stop_reason'] if result else None
+          full_budget = returncode == 0 and stop_reason == 'iteration_budget'
+          at_time_limit = hard_timed_out or (returncode == 0 and stop_reason == 'process_time_limit')
+          save('outcome.json', {'exit_code': returncode, 'stop_reason': stop_reason,
+                                'hard_timed_out': hard_timed_out, 'solver_wall_seconds': elapsed})
+          if not result or not result['feasible'] or not (full_budget or at_time_limit):
+              raise RuntimeError('No feasible result at the iteration or time limit. See saved logs.')
+          if (result['n'], result['seed'], result['segment_iters'], result['iteration_budget'],
+                  result['process_time_limit_seconds']) != (200, seed, segment_iters, iterations, soft_cap):
+              raise ValueError('Solver result does not match the requested run')
+          completed = result['completed_iterations']
+          if not 0 <= completed <= iterations or (full_budget and completed != iterations):
+              raise ValueError(f'Unexpected completed iteration count: {completed}')
+          for flag in ('adaptive_selection', 'mode_switching', 'simulated_annealing', 'destroy_repair'):
+              if result['enabled_components'][flag] is not True:
+                  raise ValueError(f'Disabled V4 component: {flag}')
+          for key, value in parameters.items():
+              if not math.isclose(result['parameters'][key], value, rel_tol=0, abs_tol=1e-10):
+                  raise ValueError(f'Parameter mismatch: {key}')
+          truck_routes, drone_routes = result['truck_routes'], result['drone_routes']
+          if (len(truck_routes), len(drone_routes)) != (trucks, drones):
+              raise ValueError('Unexpected truck or drone fleet size')
+          served = sorted(node for route in truck_routes + drone_routes for node in route if node)
+          if served != list(range(1, 201)) or not (math.isfinite(result['makespan']) and result['makespan'] > 0):
+              raise ValueError('Invalid routes or makespan')
+
+          termination = 'iteration_budget' if full_budget else 'time_limit'
+          save('completed.json', {'task': task, 'termination': termination, 'makespan': result['makespan'],
+                                  'solver_wall_seconds': elapsed, 'solver_result': result})
+          print(f'{instance} seed {seed}: {termination}, makespan={result["makespan"]:.6f} s')
+          '@ | python -
+          exit $LASTEXITCODE
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ env.ARTIFACT_PREFIX }}-${{ matrix.instance }}-s${{ matrix.seed }}${{ matrix.drone_capacity != 2.27 && format('-dd{0}', matrix.drone_capacity) || '' }}
+          path: result/
+          if-no-files-found: warn
+          retention-days: 30
+          overwrite: true
